@@ -1,6 +1,14 @@
 package mr
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"os"
+	"sort"
+	"strconv"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
@@ -9,6 +17,11 @@ import "hash/fnv"
 //
 // Map functions return a slice of KeyValue.
 //
+type ByKey []KeyValue
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 type KeyValue struct {
 	Key   string
 	Value string
@@ -37,8 +50,123 @@ func Worker(mapf func(string, string) []KeyValue,
 	// CallExample()
 	//test
 
+	for {
+		task := getTask()
+		switch task.TaskState {
+		case Map:
+			mapper(&task, mapf)
+		case Reduce:
+			reducer(&task, reducef)
+		case Wait:
+			time.Sleep(5 * time.Second)
+		case Exit:
+			return
+		}
+	}
+
 }
 
+func getTask() Task {
+	args := ExampleArgs{}
+	reply := Task{}
+	call("Coordinator.AssignTask", &args, &reply)
+	return reply
+}
+
+func writeToLocalFile(mapNumber int, reduceNumber int, intermediate *[]KeyValue) string{
+	ofname := "mr-" + strconv.Itoa(mapNumber) + "-" + strconv.Itoa(reduceNumber)
+	ofile, _ := os.Create(ofname)
+	defer func(ofile *os.File) {
+		err := ofile.Close()
+		if err != nil {
+
+		}
+	}(ofile)
+	for _, kv := range *intermediate {
+		enc := json.NewEncoder(ofile)
+		err := enc.Encode(&kv)
+		if err!= nil {
+			log.Fatalf("can not read %v" , ofile)
+		}
+	}
+	return ofname
+}
+func readFromLocalFile(filePaths []string) []KeyValue {
+	var intermediate []KeyValue
+	for _, filePath := range filePaths {
+		file, err := os.Open(filePath)
+		defer file.Close()
+		if err != nil {
+			log.Fatalf("open file error")
+		}
+		dec := json.NewDecoder(file)
+		var kv KeyValue
+		for {
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+	}
+	return intermediate
+}
+func mapper(task *Task, mapf func(string, string)[]KeyValue) {
+	content, err := ioutil.ReadFile(task.Input)
+	if err != nil {
+		log.Fatal("fail to read file: " + task.Input, err)
+	}
+	intermediates := mapf(task.Input, string(content))
+
+	buffer := make([][]KeyValue, task.NReducer)
+	//根据key hash拆分成nReduce份
+	for _, intermediate := range intermediates {
+		slot := ihash(intermediate.Key) % task.NReducer
+		buffer[slot] = append(buffer[slot], intermediate)
+	}
+	mapOutput := make([]string, 0)
+	for i := 0; i < task.NReducer; i++ {
+		mapOutput = append(mapOutput, writeToLocalFile(task.TaskNumber, i, &buffer[i]))
+	}
+	task.Intermediates = mapOutput
+	TaskCompleted(task)
+}
+func reducer(task *Task, reducef func(string, []string) string) {
+	intermediate := readFromLocalFile(task.Intermediates)
+	sort.Sort(ByKey(intermediate))
+
+	dir, _:= os.Getwd()
+	tempFile, err := ioutil.TempFile(dir, "mr-tmp-*")
+	if err != nil {
+		log.Fatal("fail to create temp file", err)
+	}
+
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+	tempFile.Close()
+	oname := fmt.Sprintf("mr-out-%d", task.TaskNumber)
+	os.Rename(tempFile.Name(), oname)
+	task.Output = oname
+	TaskCompleted(task)
+}
+func TaskCompleted(task *Task) {
+	reply := ExampleReply{}
+	call("Coordinator.AssignTask", task, &reply)
+}
 //
 // example function to show how to make an RPC call to the coordinator.
 //
